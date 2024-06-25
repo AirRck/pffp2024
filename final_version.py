@@ -269,76 +269,52 @@ class HoLeeModel(SDEModel):
         data_len = len(self.params['initial_guess']) // 2
         return [(None, None)] * data_len + [(0, None)] * data_len
 
-def rates_generator(T=100, mean_rate=0.02, volatility=0.005) -> np.ndarray:
-    """
-        Generate synthetic time series of interest rates.
+np.random.seed(39)
+volts = np.random.normal(0,1,size=121)/100
 
-        Parameters:
-            T (int): Number of time periods.
-            mean_rate (float): Mean interest rate.
-            volatility (float): Volatility of interest rates.
-
-        Returns:
-            np.ndarray: Array of synthetic interest rates.
-        """
-    time = np.arange(T)
-    rates = np.zeros(T)
-    rates[0] = mean_rate
-
-    for t in range(1, T):
-        rates[t] = rates[t-1] + volatility * np.random.normal()
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(time, rates, label='Interest Rates')
-    plt.title('Synthetic Time Series of Interest Rates')
-    plt.xlabel('Time')
-    plt.ylabel('Interest Rate')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-    return rates
-
-# Load the data
-data_url = 'https://raw.githubusercontent.com/wrcarpenter/Interest-Rate-Models/main/Data/ho-lee-tree.csv'
-data = pd.read_csv(data_url, header=None)
-rates = data.iloc[1:, 0].values  # Skip the first row
+print(volts[0])
 
 # Instantiate models
 vasicek_model = VasicekModel(params={'theta': 0.05, 'alpha': 0.1, 'sigma': 0.02})
 cir_model = CIRModel(params={'theta': 0.05, 'alpha': 0.1, 'sigma': 0.02})
-ho_lee_model = HoLeeModel(params={'theta_t': lambda t: 0.03, 'sigma_t': lambda t: 0.015, 'initial_guess': np.ones(len(rates) * 2)})
+ho_lee_model_2 = HoLeeModel(
+    params={'theta_t': lambda t: 0.03, 'sigma_t': lambda t: 0.015, 'initial_guess': np.ones(len(volts) * 2)})
 
 # Calibrate
-mean_rate = np.mean(rates)
-volatility = np.std(rates)
-print(mean_rate)
-print(volatility)
-initial_guess = [mean_rate, 0.1 * volatility, volatility]
-initial_guess_vasicek = np.array([mean_rate, 0.1 * volatility, volatility])
-initial_guess_cir = np.array([mean_rate, 0.1 * volatility, volatility])
-# initial_guess_vasicek = np.array([0.03, 0.1, 0.02])
-# initial_guess_cir = np.array([0.03, 0.1, 0.02])
-initial_guess_ho_lee = np.concatenate([np.mean(rates) * np.ones(len(rates)), np.std(rates) * np.ones(len(rates))])
+mean_vol = np.mean(volts)
+volatility = np.std(volts)
+print("mean = ", mean_vol)
+initial_guess_vasicek = np.array([mean_vol, 0.1 * volatility, volatility])
+initial_guess_cir = np.array([mean_vol, 0.1 * volatility, volatility])
+initial_guess_ho_lee = np.concatenate([np.mean(volts) * np.ones(len(volts)), np.std(volts) * np.ones(len(volts))])
 
-vasicek_model.calibrate(rates, initial_guess_vasicek)
-cir_model.calibrate(rates, initial_guess_cir)
-ho_lee_model.calibrate(rates, initial_guess_ho_lee)
+vasicek_model.calibrate(volts, initial_guess_vasicek)
+cir_model.calibrate(volts, initial_guess_cir)
+ho_lee_model_2.calibrate(volts, initial_guess_ho_lee)
 
-total_time = len(rates) - 1
+total_time = len(volts) - 1
 total_steps = total_time
-number_of_paths = 50
+number_of_paths = 100
 
-vasicek_paths = vasicek_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='euler')
-cir_paths = cir_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='euler')
-ho_lee_paths = ho_lee_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='euler')
-vasicek_paths_2 = vasicek_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='milstein')
-cir_paths_2 = cir_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='milstein')
-ho_lee_paths_2 = ho_lee_model.simulate_path(r0=rates[0], total_time=total_time, total_steps=total_steps, number_of_paths=number_of_paths, scheme='milstein')
+# Simulate paths
+vasicek_paths = vasicek_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                            number_of_paths=number_of_paths)
+vasicek_paths_mil = vasicek_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                            number_of_paths=number_of_paths, scheme='milstein')
+cir_paths = cir_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                    number_of_paths=number_of_paths)
+cir_paths_mil = cir_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                    number_of_paths=number_of_paths, scheme='milstein')
 
-# Plot
-vasicek_model.plot_paths(vasicek_paths, title="Vasicek Model Simulated Paths (Euler)")
-cir_model.plot_paths(cir_paths, title="CIR Model Simulated Paths (Euler)")
-ho_lee_model.plot_paths(ho_lee_paths, title="Ho-Lee Model Simulated Paths (Euler)")
-vasicek_model.plot_paths(vasicek_paths_2, title="Vasicek Model Simulated Paths (Milstein)")
-cir_model.plot_paths(cir_paths_2, title="CIR Model Simulated Paths (Milstein)")
-ho_lee_model.plot_paths(ho_lee_paths_2, title="Ho-Lee Model Simulated Paths (Milstein)")
+ho_lee_paths = ho_lee_model_2.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                            number_of_paths=number_of_paths)
+ho_lee_paths_mil = ho_lee_model_2.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
+                                            number_of_paths=number_of_paths, scheme='milstein')
+
+# Plot paths
+vasicek_model.plot_paths(vasicek_paths, title="Vasicek Model Simulated Paths")
+vasicek_model.plot_paths(vasicek_paths_mil, title="Vasicek Model Simulated Paths")
+cir_model.plot_paths(cir_paths, title="CIR Model Simulated Paths")
+cir_model.plot_paths(cir_paths_mil, title="CIR Model Simulated Paths")
+ho_lee_model_2.plot_paths(ho_lee_paths, title="Ho-Lee Model Simulated Paths")
+ho_lee_model_2.plot_paths(ho_lee_paths_mil, title="Ho-Lee Model Simulated Paths")
