@@ -128,8 +128,8 @@ class SDEModel:
                 """
         def objective(params):
             self.update_params(params)
-            simulated_paths = self.simulate_path(r0=data[0], total_time=len(data) - 1, total_steps=len(data) - 1, number_of_paths=1)
-            simulated_data = simulated_paths[0]
+            simulated_paths = self.simulate_path(r0=data[0], total_time=len(data) - 1, total_steps=len(data) - 1, number_of_paths=20)
+            simulated_data = np.std(simulated_paths)
             return np.mean((simulated_data - data)**2)
 
         result = minimize(objective, initial_guess, bounds=self.get_bounds(), method='L-BFGS-B')
