@@ -1,6 +1,6 @@
 # PFFP2024
 
-A small, quant-ready Python framework for simulating and calibrating short-rate models. It runs fast, makes plots, and keeps the code clean and modular.
+A small, quant-ready Python framework for simulating and calibrating short-rate models. It runs fast, makes plots, and keeps the code clean and modular. Project for "Python in finance, finance in Python" course at Jagiellonian University
 
 Models
 
