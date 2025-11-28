@@ -1,320 +1,431 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Quant-ready SDE framework for short-rate models with Monte Carlo simulation and calibration.
+
+Implements:
+- Base SDEModel with vectorized Euler–Maruyama and Milstein schemes
+- Vasicek, CIR, and Ho–Lee models
+- Practical, robust calibration (mean + terminal vol fit)
+- Safe CIR square-root handling and Ho–Lee indexing clamp
+- Clean __main__ demo (lightweight)
+"""
+
+from __future__ import annotations
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from typing import Tuple, Dict, Any
-import pandas as pd
+from typing import Tuple, Dict, Any, Iterable
 
+
+# -----------------------------
+# Base class
+# -----------------------------
 class SDEModel:
     """
-        Base class for Stochastic Differential Equation (SDE) models.
+    Base class for Stochastic Differential Equation (SDE) models.
 
-        Attributes:
-            params (dict): Parameters of the SDE model.
+    Subclasses must implement:
+      - drift(r, t) -> np.ndarray
+      - diffusion(r, t) -> np.ndarray
+      - diffusion_derivative(r, t) -> np.ndarray
+      - update_params(params: np.ndarray) -> None
+      - get_bounds() -> Tuple[Tuple[float, float], ...]
 
-        Methods:
-            drift(r, t):
-                Computes the drift term of the SDE.
-            diffusion(r, t):
-                Computes the diffusion term of the SDE.
-            simulate_path(r0, total_time, total_steps, number_of_paths, scheme='euler'):
-                Simulates paths of the SDE using Euler-Maruyama or Milstein scheme.
-            diffusion_derivative(r, t):
-                Computes the derivative of the diffusion term with respect to r.
-            calibrate(data, initial_guess):
-                Calibrates the model parameters to given data.
-            update_params(params):
-                Updates the model parameters with new values.
-            get_bounds():
-                Returns the parameter bounds for optimization.
-            plot_paths(paths, title='Simulated Paths'):
-                Plots the simulated paths of the model.
-        """
+    Key methods:
+      - simulate_path: vectorized MC with Euler or Milstein
+      - calibrate: practical calibration to time series (mean path + terminal vol)
+      - plot_paths: quick viewer
+    """
 
     def __init__(self, params: Dict[str, Any]):
-        """
-               Initialize an SDE model with parameters.
-
-               Args:
-                   params (dict): Dictionary containing initial parameters of the model.
-               """
         self.params = params
 
-    def drift(self, r: float, t: float) -> float:
+    # --- Model pieces to override ---
+    def drift(self, r: np.ndarray, t: float) -> np.ndarray:
+        raise NotImplementedError
+
+    def diffusion(self, r: np.ndarray, t: float) -> np.ndarray:
+        raise NotImplementedError
+
+    def diffusion_derivative(self, r: np.ndarray, t: float) -> np.ndarray:
+        raise NotImplementedError
+
+    def update_params(self, params: np.ndarray) -> None:
+        raise NotImplementedError
+
+    def get_bounds(self) -> Tuple[Tuple[float, float], ...]:
+        raise NotImplementedError
+
+    # --- Core engine ---
+    def simulate_path(
+        self,
+        r0: float,
+        total_time: float,
+        total_steps: int,
+        number_of_paths: int,
+        scheme: str = "euler",
+        project_nonnegative: bool = False,
+        random_state: int | None = None,
+    ) -> np.ndarray:
         """
-                Placeholder for drift function. Must be implemented in subclass.
+        Vectorized Monte Carlo simulation.
 
-                Args:
-                    r (float): Current value of the process.
-                    t (float): Current time.
+        Args:
+            r0: initial short rate
+            total_time: horizon (in "time units")
+            total_steps: number of steps
+            number_of_paths: MC paths
+            scheme: 'euler' or 'milstein'
+            project_nonnegative: if True, clamp paths >= 0 after each step
+            random_state: optional seed
 
-                Returns:
-                    float: Drift at time t given state r.
-                """
-        raise NotImplementedError("Drift function is not implemented")
-
-    def diffusion(self, r: float, t: float) -> float:
+        Returns:
+            np.ndarray of shape (number_of_paths, total_steps + 1)
         """
-                Placeholder for diffusion function. Must be implemented in subclass.
+        if total_steps <= 0:
+            raise ValueError("total_steps must be >= 1")
+        if number_of_paths <= 0:
+            raise ValueError("number_of_paths must be >= 1")
 
-                Args:
-                    r (float): Current value of the process.
-                    t (float): Current time.
+        if random_state is not None:
+            rng = np.random.default_rng(random_state)
+            normal = rng.normal
+        else:
+            normal = np.random.normal
 
-                Returns:
-                    float: Diffusion at time t given state r.
-                """
-        raise NotImplementedError("Diffusion function is not implemented")
-
-    def simulate_path(self, r0: float, total_time: float, total_steps: int, number_of_paths: int, scheme: str = 'euler') -> np.ndarray:
-        """
-               Simulates paths of the SDE model using specified numerical scheme.
-
-               Args:
-                   r0 (float): Initial value of the process.
-                   total_time (float): Total time horizon for simulation.
-                   total_steps (int): Number of time steps.
-                   number_of_paths (int): Number of paths to simulate.
-                   scheme (str, optional): Numerical scheme to use ('euler' or 'milstein'). Defaults to 'euler'.
-
-               Returns:
-                   np.ndarray: Array of simulated paths with shape (number_of_paths, total_steps + 1).
-               """
         dt = total_time / total_steps
-        paths = np.zeros((number_of_paths, total_steps + 1))
+        sqrt_dt = np.sqrt(dt)
+
+        paths = np.zeros((number_of_paths, total_steps + 1), dtype=float)
         paths[:, 0] = r0
 
         for i in range(1, total_steps + 1):
             t = (i - 1) * dt
-            W = np.random.normal(0, 1, number_of_paths)
+            r_prev = paths[:, i - 1]
+            dW = sqrt_dt * normal(size=number_of_paths)
 
-            if scheme == 'euler':
-                for j in range(number_of_paths):
-                    dW = np.sqrt(dt) * W[j]
-                    paths[j, i] = (paths[j, i-1] +
-                                   self.drift(paths[j, i-1], t) * dt +
-                                   self.diffusion(paths[j, i-1], t) * dW)
-            elif scheme == 'milstein':
-                for j in range(number_of_paths):
-                    dW = np.sqrt(dt) * W[j]
-                    diffusion_value = self.diffusion(paths[j, i-1], t)
-                    paths[j, i] = (paths[j, i-1] +
-                                   self.drift(paths[j, i-1], t) * dt +
-                                   diffusion_value * dW +
-                                   0.5 * diffusion_value *
-                                   self.diffusion_derivative(paths[j, i-1], t) * (dW**2 - dt))
+            mu = self.drift(r_prev, t)
+            sig = self.diffusion(r_prev, t)
+
+            if scheme == "euler":
+                r_new = r_prev + mu * dt + sig * dW
+            elif scheme == "milstein":
+                sig_r = self.diffusion_derivative(r_prev, t)
+                r_new = r_prev + mu * dt + sig * dW + 0.5 * sig * sig_r * (dW**2 - dt)
+            else:
+                raise ValueError(f"Unknown scheme: {scheme}")
+
+            if project_nonnegative:
+                r_new = np.maximum(r_new, 0.0)
+
+            paths[:, i] = r_new
+
         return paths
 
-    def diffusion_derivative(self, r: float, t: float) -> float:
+    # --- Practical calibration ---
+    def calibrate(
+        self,
+        data: np.ndarray,
+        initial_guess: Iterable[float],
+        number_of_paths: int = 200,
+        scheme: str = "euler",
+        random_state: int | None = 123,
+        weight_mean: float = 1.0,
+        weight_vol: float = 1.0,
+    ):
         """
-               Placeholder for diffusion derivative function. Must be implemented in subclass.
+        Practical, robust calibration to a short-rate time series.
 
-               Args:
-                   r (float): Current value of the process.
-                   t (float): Current time.
+        Objective:
+            MSE between model mean path and data + penalty on terminal volatility difference.
 
-               Returns:
-                   float: Derivative of diffusion with respect to r at time t given state r.
-               """
-        raise NotImplementedError("Diffusion derivative is not implemented")
+        Args:
+            data: array-like, observed short-rate path (length T+1)
+            initial_guess: starting parameters for optimizer
+            number_of_paths: MC paths inside objective
+            scheme: 'euler' or 'milstein'
+            random_state: RNG seed
+            weight_mean: weight for mean-path MSE
+            weight_vol:  weight for terminal vol penalty
 
-    def calibrate(self, data: np.ndarray, initial_guess: np.ndarray):
+        Returns:
+            scipy OptimizeResult
         """
-                Calibrates the model parameters to match given data using optimization.
+        data = np.asarray(data, dtype=float).ravel()
+        T = len(data) - 1
+        if T <= 0:
+            raise ValueError("Need at least 2 observations for calibration (T >= 1).")
 
-                Args:
-                    data (np.ndarray): Observed data to calibrate the model against.
-                    initial_guess (np.ndarray): Initial guess for the model parameters.
+        bounds = self.get_bounds()
+        init = np.asarray(list(initial_guess), dtype=float)
+        if len(init) != len(bounds):
+            raise ValueError("initial_guess length must match number of parameters.")
 
-                """
-        def objective(params):
+        def objective(params: np.ndarray) -> float:
+            # Update model parameters
             self.update_params(params)
-            simulated_paths = self.simulate_path(r0=data[0], total_time=len(data) - 1, total_steps=len(data) - 1, number_of_paths=20)
-            simulated_data = np.std(simulated_paths)
-            return np.mean((simulated_data - data)**2)
 
-        result = minimize(objective, initial_guess, bounds=self.get_bounds(), method='L-BFGS-B')
-        self.update_params(result.x)
+            # Simulate model
+            paths = self.simulate_path(
+                r0=data[0],
+                total_time=T,
+                total_steps=T,
+                number_of_paths=number_of_paths,
+                scheme=scheme,
+                # For CIR-like models, it's helpful to keep non-negativity during calibration
+                project_nonnegative=isinstance(self, CIRModel),
+                random_state=random_state,
+            )
+            model_mean = paths.mean(axis=0)
+            model_std = paths.std(axis=0)
 
-    def update_params(self, params: np.ndarray):
-        """
-               Updates the model parameters with new values.
+            # Mean path fit across the whole horizon
+            mse_mean = np.mean((model_mean - data) ** 2)
 
-               Args:
-                   params (np.ndarray): New parameter values.
-               """
-        raise NotImplementedError("Parameter update function is not implemented")
+            # Terminal volatility fit
+            terminal_vol_penalty = (model_std[-1] - data.std()) ** 2
 
-    def get_bounds(self) -> Tuple[Tuple[float, float]]:
-        """
-                Returns the bounds for optimization of model parameters.
+            return weight_mean * mse_mean + weight_vol * terminal_vol_penalty
 
-                Returns:
-                    Tuple[Tuple[float, float]]: Bounds for each parameter.
-                """
-        raise NotImplementedError("Bounds function is not implemented")
+        res = minimize(
+            objective,
+            init,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": 200, "ftol": 1e-8},
+        )
+        if not res.success:
+            # Keep parameters at the best point found anyway:
+            self.update_params(res.x)
+            raise RuntimeError(f"Calibration failed: {res.message}")
 
-    def plot_paths(self, paths: np.ndarray, title: str = "Simulated Paths"):
-        """
-                Plots the simulated paths of the model.
+        self.update_params(res.x)
+        return res
 
-                Args:
-                    paths (np.ndarray): Array of simulated paths.
-                    title (str, optional): Title of the plot. Defaults to "Simulated Paths".
-                """
-        plt.figure(figsize=(12, 6))
-        for i in range(paths.shape[0]):
-            plt.plot(paths[i])
+    # --- Plot helper ---
+    @staticmethod
+    def plot_paths(paths: np.ndarray, title: str = "Simulated Paths", alpha: float = 0.35):
+        plt.figure(figsize=(10, 5))
+        plt.plot(paths.T, alpha=alpha)
         plt.title(title)
-        plt.xlabel('Time Step')
-        plt.ylabel('Interest Rate')
+        plt.xlabel("Time step")
+        plt.ylabel("Short rate")
+        plt.tight_layout()
         plt.show()
 
+
+# -----------------------------
+# Vasicek model
+# -----------------------------
 class VasicekModel(SDEModel):
     """
-        Vasicek Model class, inheriting from SDEModel.
+    dr_t = alpha*(theta - r_t) dt + sigma dW_t
+    """
 
-        Methods:
-            drift(r, t):
-                Computes the drift term of the Vasicek model.
-            diffusion(r, t):
-                Computes the diffusion term of the Vasicek model.
-            diffusion_derivative(r, t):
-                Computes the derivative of the diffusion term with respect to r for the Vasicek model.
-            update_params(params):
-                Updates the model parameters with new values for the Vasicek model.
-            get_bounds():
-                Returns the parameter bounds for optimization for the Vasicek model.
-        """
-    def drift(self, r: float, t: float) -> float:
-        theta, alpha, sigma = self.params['theta'], self.params['alpha'], self.params['sigma']
-        return theta - alpha * r
+    def drift(self, r: np.ndarray, t: float) -> np.ndarray:
+        theta, alpha, sigma = self.params["theta"], self.params["alpha"], self.params["sigma"]
+        return alpha * (theta - r)
 
-    def diffusion(self, r: float, t: float) -> float:
-        return self.params['sigma']
+    def diffusion(self, r: np.ndarray, t: float) -> np.ndarray:
+        return np.full_like(r, self.params["sigma"], dtype=float)
 
-    def diffusion_derivative(self, r: float, t: float) -> float:
-        return 0
+    def diffusion_derivative(self, r: np.ndarray, t: float) -> np.ndarray:
+        return np.zeros_like(r, dtype=float)
 
-    def update_params(self, params: np.ndarray):
-        self.params['theta'], self.params['alpha'], self.params['sigma'] = params
+    def update_params(self, params: np.ndarray) -> None:
+        self.params["theta"], self.params["alpha"], self.params["sigma"] = map(float, params)
 
-    def get_bounds(self) -> Tuple[Tuple[float, float]]:
-        return [(None, None), (0, None), (0, None)]
+    def get_bounds(self) -> Tuple[Tuple[float, float], ...]:
+        # Loose bounds: theta in [-1,1], alpha>0, sigma>0
+        return ((-1.0, 1.0), (1e-6, None), (1e-8, None))
 
+
+# -----------------------------
+# CIR model
+# -----------------------------
 class CIRModel(SDEModel):
     """
-       CIR Model class, inheriting from SDEModel.
+    dr_t = alpha*(theta - r_t) dt + sigma * sqrt(max(r_t, 0)) dW_t
 
-       Methods:
-           drift(r, t):
-               Computes the drift term of the CIR model.
-           diffusion(r, t):
-               Computes the diffusion term of the CIR model.
-           diffusion_derivative(r, t):
-               Computes the derivative of the diffusion term with respect to r for the CIR model.
-           update_params(params):
-               Updates the model parameters with new values for the CIR model.
-           get_bounds():
-               Returns the parameter bounds for optimization for the CIR model.
-       """
-    def drift(self, r: float, t: float) -> float:
-        theta, alpha, sigma = self.params['theta'], self.params['alpha'], self.params['sigma']
-        return theta - alpha * r
+    Notes:
+    - Uses full-truncation-style sqrt handling to avoid invalid values.
+    - Milstein derivative is computed safely with a small floor.
+    """
 
-    def diffusion(self, r: float, t: float) -> float:
-        return self.params['sigma'] * np.sqrt(r)
+    def drift(self, r: np.ndarray, t: float) -> np.ndarray:
+        theta, alpha, sigma = self.params["theta"], self.params["alpha"], self.params["sigma"]
+        return alpha * (theta - r)
 
-    def diffusion_derivative(self, r: float, t: float) -> float:
-        return 0.5 * self.params['sigma'] / np.sqrt(r)
+    def diffusion(self, r: np.ndarray, t: float) -> np.ndarray:
+        return self.params["sigma"] * np.sqrt(np.maximum(r, 0.0))
 
-    def update_params(self, params: np.ndarray):
-        self.params['theta'], self.params['alpha'], self.params['sigma'] = params
+    def diffusion_derivative(self, r: np.ndarray, t: float) -> np.ndarray:
+        safe_r = np.maximum(r, 1e-8)
+        return 0.5 * self.params["sigma"] / np.sqrt(safe_r)
 
-    def get_bounds(self) -> Tuple[Tuple[float, float]]:
-        return [(None, None), (0, None), (0, None)]
+    def update_params(self, params: np.ndarray) -> None:
+        self.params["theta"], self.params["alpha"], self.params["sigma"] = map(float, params)
 
+    def get_bounds(self) -> Tuple[Tuple[float, float], ...]:
+        # Feller condition is not enforced here (for simplicity), but alpha,sigma>0
+        return ((-1.0, 1.0), (1e-6, None), (1e-8, None))
+
+
+# -----------------------------
+# Ho–Lee model
+# -----------------------------
 class HoLeeModel(SDEModel):
     """
-       Ho-Lee Model class, inheriting from SDEModel.
+    dr_t = theta(t) dt + sigma(t) dW_t
 
-       Methods:
-           drift(r, t):
-               Computes the drift term of the Ho-Lee model.
-           diffusion(r, t):
-               Computes the diffusion term of the Ho-Lee model.
-           diffusion_derivative(r, t):
-               Computes the derivative of the diffusion term with respect to r for the Ho-Lee model.
-           update_params(params):
-               Updates the model parameters with new values for the Ho-Lee model.
-           get_bounds():
-               Returns the parameter bounds for optimization for the Ho-Lee model.
-       """
-    def drift(self, r: float, t: float) -> float:
-        return self.params['theta_t'](t)
+    This implementation supports a piecewise-constant parameterization with
+    clamped indices to avoid out-of-range errors.
+    """
 
-    def diffusion(self, r: float, t: float) -> float:
-        return self.params['sigma_t'](t)
+    def drift(self, r: np.ndarray, t: float) -> np.ndarray:
+        return np.full_like(r, self.params["theta_t"](t), dtype=float)
 
-    def diffusion_derivative(self, r: float, t: float) -> float:
-        return 0
+    def diffusion(self, r: np.ndarray, t: float) -> np.ndarray:
+        return np.full_like(r, self.params["sigma_t"](t), dtype=float)
 
-    def update_params(self, params: np.ndarray):
-        data_len = len(params) // 2
-        theta_t = params[:data_len]
-        sigma_t = params[data_len:]
-        self.params['theta_t'] = lambda t: theta_t[int(t)]
-        self.params['sigma_t'] = lambda t: sigma_t[int(t)]
+    def diffusion_derivative(self, r: np.ndarray, t: float) -> np.ndarray:
+        return np.zeros_like(r, dtype=float)
 
-    def get_bounds(self) -> Tuple[Tuple[float, float]]:
-        data_len = len(self.params['initial_guess']) // 2
-        return [(None, None)] * data_len + [(0, None)] * data_len
+    def update_params(self, params: np.ndarray) -> None:
+        n = int(len(params) // 2)
+        theta_arr = np.asarray(params[:n], dtype=float)
+        sigma_arr = np.asarray(params[n:], dtype=float)
+        # Clamp indexing
+        def theta_t(tt: float) -> float:
+            idx = min(max(int(tt), 0), n - 1)
+            return float(theta_arr[idx])
 
-np.random.seed(39)
-volts = np.random.normal(0,1,size=121)/100
+        def sigma_t(tt: float) -> float:
+            idx = min(max(int(tt), 0), n - 1)
+            return float(sigma_arr[idx])
 
-print(volts[0])
+        self.params["theta_t"] = theta_t
+        self.params["sigma_t"] = sigma_t
+        self.params["n_params"] = n
 
-# Instantiate models
-vasicek_model = VasicekModel(params={'theta': 0.05, 'alpha': 0.1, 'sigma': 0.02})
-cir_model = CIRModel(params={'theta': 0.05, 'alpha': 0.1, 'sigma': 0.02})
-ho_lee_model_2 = HoLeeModel(
-    params={'theta_t': lambda t: 0.03, 'sigma_t': lambda t: 0.015, 'initial_guess': np.ones(len(volts) * 2)})
+    def get_bounds(self) -> Tuple[Tuple[float, float], ...]:
+        # Expect 'n_params' in params to size the piecewise-constant vectors
+        n = int(self.params.get("n_params", 8))
+        # theta free-ish, sigma > 0
+        return tuple(((-1.0, 1.0) for _ in range(n))) + tuple(((1e-8, None) for _ in range(n)))
 
-# Calibrate
-mean_vol = np.mean(volts)
-volatility = np.std(volts)
-print("mean = ", mean_vol)
-initial_guess_vasicek = np.array([mean_vol, 0.1 * volatility, volatility])
-initial_guess_cir = np.array([mean_vol, 0.1 * volatility, volatility])
-initial_guess_ho_lee = np.concatenate([np.mean(volts) * np.ones(len(volts)), np.std(volts) * np.ones(len(volts))])
 
-vasicek_model.calibrate(volts, initial_guess_vasicek)
-cir_model.calibrate(volts, initial_guess_cir)
-ho_lee_model_2.calibrate(volts, initial_guess_ho_lee)
+# -----------------------------
+# Demo / Quick test
+# -----------------------------
+def _synthetic_short_rate(T: int, r0: float = 0.02, drift: float = 0.0, vol: float = 0.01, seed: int = 7) -> np.ndarray:
+    """
+    Generate a simple synthetic short-rate series (discretized OU-like), length T+1.
+    """
+    rng = np.random.default_rng(seed)
+    r = np.empty(T + 1, dtype=float)
+    r[0] = r0
+    dt = 1.0
+    for t in range(1, T + 1):
+        r[t] = r[t - 1] + drift * dt + vol * np.sqrt(dt) * rng.standard_normal()
+    return r
 
-total_time = len(volts) - 1
-total_steps = total_time
-number_of_paths = 100
 
-# Simulate paths
-vasicek_paths = vasicek_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                            number_of_paths=number_of_paths)
-vasicek_paths_mil = vasicek_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                            number_of_paths=number_of_paths, scheme='milstein')
-cir_paths = cir_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                    number_of_paths=number_of_paths)
-cir_paths_mil = cir_model.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                    number_of_paths=number_of_paths, scheme='milstein')
+if __name__ == "__main__":
+    # Lightweight demo so the file can be run safely.
+    np.random.seed(39)
 
-ho_lee_paths = ho_lee_model_2.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                            number_of_paths=number_of_paths)
-ho_lee_paths_mil = ho_lee_model_2.simulate_path(r0=0.03, total_time=total_time, total_steps=total_steps,
-                                            number_of_paths=number_of_paths, scheme='milstein')
+    # Synthetic "observed" short-rate path
+    T = 120
+    data = _synthetic_short_rate(T=T, r0=0.025, drift=0.0001, vol=0.0075, seed=11)
 
-# Plot paths
-vasicek_model.plot_paths(vasicek_paths, title="Vasicek Model Simulated Paths")
-vasicek_model.plot_paths(vasicek_paths_mil, title="Vasicek Model Simulated Paths")
-cir_model.plot_paths(cir_paths, title="CIR Model Simulated Paths")
-cir_model.plot_paths(cir_paths_mil, title="CIR Model Simulated Paths")
-ho_lee_model_2.plot_paths(ho_lee_paths, title="Ho-Lee Model Simulated Paths")
-ho_lee_model_2.plot_paths(ho_lee_paths_mil, title="Ho-Lee Model Simulated Paths")
+    # ---------------- Vasicek ----------------
+    vas = VasicekModel(params={"theta": 0.03, "alpha": 0.1, "sigma": 0.02})
+    init_vas = np.array([0.02, 0.2, 0.01], dtype=float)
+    print("Calibrating Vasicek...")
+    res_vas = vas.calibrate(data, init_vas, number_of_paths=300, scheme="euler", random_state=123)
+    print("  Vasicek params:", vas.params, "\n")
+
+    vas_paths = vas.simulate_path(
+        r0=data[0],
+        total_time=T,
+        total_steps=T,
+        number_of_paths=200,
+        scheme="euler",
+        random_state=321,
+    )
+    vas.plot_paths(vas_paths, title="Vasicek – Simulated Paths")
+
+    # ---------------- CIR ----------------
+    cir = CIRModel(params={"theta": 0.03, "alpha": 0.2, "sigma": 0.02})
+    init_cir = np.array([0.02, 0.2, 0.01], dtype=float)
+    print("Calibrating CIR...")
+    try:
+        res_cir = cir.calibrate(data, init_cir, number_of_paths=300, scheme="euler", random_state=123)
+        print("  CIR params:", cir.params, "\n")
+    except RuntimeError as e:
+        print("  CIR calibration failed (keeping best found):", e)
+        print("  CIR params (best so far):", cir.params, "\n")
+
+    cir_paths = cir.simulate_path(
+        r0=data[0],
+        total_time=T,
+        total_steps=T,
+        number_of_paths=200,
+        scheme="milstein",
+        project_nonnegative=True,
+        random_state=222,
+    )
+    cir.plot_paths(cir_paths, title="CIR – Simulated Paths (Milstein, projected ≥0)")
+
+    # ---------------- Ho–Lee (piecewise constant) ----------------
+
+    n_segments = 6  # lower dimensional → more stable calibration
+    ho = HoLeeModel(
+        params={
+            "theta_t": (lambda t: 0.0),
+            "sigma_t": (lambda t: 0.01),
+            "n_params": n_segments,
+        }
+    )
+
+    # Initial guess: small drift, 1% sigma across segments
+    init_ho = np.concatenate([
+        np.full(n_segments, 0.0),  # theta guess per segment
+        np.full(n_segments, 0.01)  # sigma guess per segment
+    ])
+
+    # Tighter, practical bounds (per segment):
+    # θ(t) kept small; σ(t) bounded away from 0 to avoid degenerate diffusion
+    ho.get_bounds = lambda: tuple(((-0.005, 0.005) for _ in range(n_segments))) + \
+                            tuple(((0.001, 0.05) for _ in range(n_segments)))
+
+    print(f"Calibrating Ho–Lee with {n_segments} segments (stronger vol weight)...")
+    try:
+        res_ho = ho.calibrate(
+            data,
+            init_ho,
+            number_of_paths=300,
+            scheme="euler",
+            random_state=456,
+            weight_mean=1.0,
+            weight_vol=5.0,  # ↑ emphasize volatility so σ̂(t) won’t collapse
+        )
+        print("  Ho–Lee calibrated (first 3 θ, σ):",
+              [ho.params["theta_t"](i) for i in range(min(3, n_segments))],
+              [ho.params["sigma_t"](i) for i in range(min(3, n_segments))], "\n")
+    except RuntimeError as e:
+        print("  Ho–Lee calibration failed (keeping best found):", e, "\n")
+
+    # Simulate and plot with calibrated params
+    ho_paths = ho.simulate_path(
+        r0=data[0],
+        total_time=T,
+        total_steps=T,
+        number_of_paths=200,
+        scheme="euler",
+        random_state=999,
+    )
+    ho.plot_paths(ho_paths, title="Ho–Lee – Simulated Paths (regularized)")
